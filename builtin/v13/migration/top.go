@@ -2,7 +2,6 @@ package migration
 
 import (
 	"context"
-
 	adt13 "github.com/filecoin-project/go-state-types/builtin/v13/util/adt"
 
 	system12 "github.com/filecoin-project/go-state-types/builtin/v12/system"
@@ -67,12 +66,25 @@ func MigrateStateTree(ctx context.Context, store cbor.IpldStore, newManifestCID 
 	// Set of prior version code CIDs for actors to defer during iteration, for explicit migration afterwards.
 	deferredCodeIDs := make(map[cid.Cid]struct{})
 
+	market12Cid := cid.Undef
+	miner12Cid := cid.Undef
+
 	for _, oldEntry := range oldManifestData.Entries {
+		if oldEntry.Name == manifest.MarketKey {
+			market12Cid = oldEntry.Code
+		}
+		if oldEntry.Name == manifest.MinerKey {
+			miner12Cid = oldEntry.Code
+		}
 		newCodeCID, ok := newManifest.Get(oldEntry.Name)
 		if !ok {
 			return cid.Undef, xerrors.Errorf("code cid for %s actor not found in new manifest", oldEntry.Name)
 		}
 		migrations[oldEntry.Code] = migration.CachedMigration(cache, migration.CodeMigrator{OutCodeCID: newCodeCID})
+	}
+
+	if market12Cid == cid.Undef || miner12Cid == cid.Undef {
+		return cid.Undef, xerrors.Errorf("could not find market or miner actor in old manifest")
 	}
 
 	// migrations that migrate both code and state, override entries in `migrations`
@@ -88,6 +100,39 @@ func MigrateStateTree(ctx context.Context, store cbor.IpldStore, newManifestCID 
 
 	if len(migrations)+len(deferredCodeIDs) != len(oldManifestData.Entries) {
 		return cid.Undef, xerrors.Errorf("incomplete migration specification with %d code CIDs, need %d", len(migrations), len(oldManifestData.Entries))
+	}
+
+	// Miner actors
+	miner13Cid, ok := newManifest.Get(manifest.MinerKey)
+	if !ok {
+		return cid.Undef, xerrors.Errorf("code cid for miner actor not found in new manifest")
+	}
+
+	ps := &providerSectors{
+		dealToSector: map[abi.DealID]abi.SectorID{},
+	}
+
+	minerMig, err := newMinerMigrator(ctx, store, miner13Cid, ps)
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("failed to create miner migrator: %w", err)
+	}
+
+	migrations[miner12Cid] = migration.CachedMigration(cache, minerMig)
+
+	// The Market Actor
+	market13Cid, ok := newManifest.Get(manifest.MarketKey)
+	if !ok {
+		return cid.Undef, xerrors.Errorf("code cid for market actor not found in new manifest")
+	}
+
+	marketMig, err := newMarketMigrator(ctx, store, market13Cid, ps)
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("failed to create market migrator: %w", err)
+	}
+	migrations[market12Cid] = migration.CachedMigration(cache, marketMig)
+
+	if len(migrations)+len(deferredCodeIDs) != len(oldManifestData.Entries) {
+		return cid.Undef, xerrors.Errorf("incomplete migration specification with %d code CIDs, need %d", len(migrations)+len(deferredCodeIDs), len(oldManifestData.Entries))
 	}
 
 	actorsOut, err := migration.RunMigration(ctx, cfg, cache, store, log, actorsIn, migrations)
