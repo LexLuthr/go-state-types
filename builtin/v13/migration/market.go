@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-amt-ipld/v4"
 	"github.com/filecoin-project/go-state-types/abi"
@@ -101,7 +102,7 @@ func (m *marketMigrator) migrateProviderSectorsAndStates(ctx context.Context, st
 	var providerSectorsRoot, newStateArrayRoot cid.Cid
 
 	if okIn && okInPr && okOut && okOutPs {
-		providerSectorsRoot, newStateArrayRoot, err = m.migrateProviderSectorsAndStatesWithDiff(ctx, store, prevInStates, prevOutStates, prevOutProviderSectors, states, prevInProposals)
+		providerSectorsRoot, newStateArrayRoot, err = m.migrateProviderSectorsAndStatesWithDiff(ctx, store, prevInStates, prevOutStates, prevOutProviderSectors, states, prevInProposals, proposals)
 		if err != nil {
 			return cid.Undef, cid.Undef, xerrors.Errorf("failed to migrate provider sectors (diff): %w", err)
 		}
@@ -131,7 +132,7 @@ func (m *marketMigrator) migrateProviderSectorsAndStates(ctx context.Context, st
 	return providerSectorsRoot, newStateArrayRoot, nil
 }
 
-func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Context, store cbor.IpldStore, prevInStatesCid, prevOutStatesCid, prevOutProviderSectorsCid, inStatesCid, prevInProposals cid.Cid) (cid.Cid, cid.Cid, error) {
+func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Context, store cbor.IpldStore, prevInStatesCid, prevOutStatesCid, prevOutProviderSectorsCid, inStatesCid, prevInProposals, inProposals cid.Cid) (cid.Cid, cid.Cid, error) {
 	diffs, err := amt.Diff(ctx, store, store, prevInStatesCid, inStatesCid, amt.UseTreeBitWidth(market12.StatesAmtBitwidth))
 	if err != nil {
 		return cid.Undef, cid.Undef, xerrors.Errorf("failed to diff old and new deal state AMTs: %w", err)
@@ -150,6 +151,11 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 	}
 
 	prevInProposalsArr, err := adt.AsArray(ctxStore, prevInProposals, market12.ProposalsAmtBitwidth)
+	if err != nil {
+		return cid.Undef, cid.Undef, xerrors.Errorf("failed to load proposals map: %w", err)
+	}
+
+	inProposalsArr, err := adt.AsArray(ctxStore, inProposals, market12.ProposalsAmtBitwidth)
 	if err != nil {
 		return cid.Undef, cid.Undef, xerrors.Errorf("failed to load proposals map: %w", err)
 	}
@@ -259,8 +265,6 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 
 		case amt.Modify: // in case of chain going forward this is just deals changing states, in reorgs we may see different deals
 
-			// TODO: check that the deal is the same deal by looking at inProposalsArr and prevInProposalsArr
-
 			var oldState, prevOldState market12.DealState
 			var newState market13.DealState
 			if err := prevOldState.UnmarshalCBOR(bytes.NewReader(change.Before.Raw)); err != nil {
@@ -281,19 +285,73 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 			newState.LastUpdatedEpoch = oldState.LastUpdatedEpoch
 			newState.SectorStartEpoch = oldState.SectorStartEpoch
 
-			// if nowOld.Slash == -1, then 'now' is not slashed, so we should try to find the sector
-			// we probably don't care about prevOldSlash?? beyond it changing from newSlash?
+			// check that the deal is the same deal by looking at inProposalsArr and prevInProposalsArr
+			// if it's not we're dealing with a reorg that changed the deal
+			// NOTE: This path is only possible in case of more serious reorgs, probably won't happen in practice
 
-			//fmt.Printf("deal %d slash %d -> %d, update %d -> %d (prev sec: %d)\n", deal, prevOldState.SlashEpoch, oldState.SlashEpoch, prevOldState.LastUpdatedEpoch, oldState.LastUpdatedEpoch, newState.SectorNumber)
+			var prevInState market12.DealProposal
+			var inState market12.DealProposal
 
-			if prevOldState.SlashEpoch == -1 && oldState.SlashEpoch != -1 {
-				// not slashed -> slashed
-				//fmt.Printf("deal %d slash -1 -> %d\n", deal, oldState.SlashEpoch)
+			found, err := prevInProposalsArr.Get(uint64(deal), &prevInState)
+			if err != nil {
+				return cid.Undef, cid.Undef, xerrors.Errorf("failed to get previous in proposal: %w", err)
+			}
+			if !found {
+				return cid.Undef, cid.Undef, xerrors.Errorf("failed to get previous in proposal: not found")
+			}
 
-				// this is also handling FIP: if such a sector cannot be found, assert that the deal's end epoch has passed and use sector ID 0
+			found, err = inProposalsArr.Get(uint64(deal), &inState)
+			if err != nil {
+				return cid.Undef, cid.Undef, xerrors.Errorf("failed to get proposal: %w", err)
+			}
+			if !found {
+				return cid.Undef, cid.Undef, xerrors.Errorf("failed to get proposal: not found")
+			}
 
-				if err := removeProviderSectorEntry(deal, &newState); err != nil {
-					return cid.Cid{}, cid.Cid{}, xerrors.Errorf("failed to remove provider sector entry: %w", err)
+			prevPropCid, err := prevInState.Cid()
+			if err != nil {
+				return cid.Undef, cid.Undef, xerrors.Errorf("failed to get previous proposal CID: %w", err)
+			}
+			inPropCid, err := inState.Cid()
+			if err != nil {
+				return cid.Undef, cid.Undef, xerrors.Errorf("failed to get proposal CID: %w", err)
+			}
+
+			if prevPropCid != inPropCid {
+				// WE ARE DEALING WITH A REORG THAT CHANGED THE DEAL
+
+				fmt.Printf("warn: deal %d changed\n", deal)
+
+				// we need to remove the old deal from the provider sectors
+				if err := removeProviderSectorEntry(deal, &newState); err != nil { // this sets newState.SectorNumber to 0
+					return cid.Undef, cid.Undef, xerrors.Errorf("failed to remove provider sector entry: %w", err)
+				}
+
+				// now like in .Add case we may need to add the new deal to the provider sectors
+				if oldState.SlashEpoch == -1 {
+					si, err := addProviderSectorEntry(deal)
+					if err != nil {
+						return cid.Cid{}, cid.Cid{}, xerrors.Errorf("failed to add provider sector entry: %w", err)
+					}
+					newState.SectorNumber = si
+				}
+			} else {
+				// in this case the deal state did change but the deal proposal did not
+
+				// if nowOld.Slash == -1, then 'now' is not slashed, so we should try to find the sector
+				// we probably don't care about prevOldSlash?? beyond it changing from newSlash?
+
+				//fmt.Printf("deal %d slash %d -> %d, update %d -> %d (prev sec: %d)\n", deal, prevOldState.SlashEpoch, oldState.SlashEpoch, prevOldState.LastUpdatedEpoch, oldState.LastUpdatedEpoch, newState.SectorNumber)
+
+				if prevOldState.SlashEpoch == -1 && oldState.SlashEpoch != -1 {
+					// not slashed -> slashed
+					//fmt.Printf("deal %d slash -1 -> %d\n", deal, oldState.SlashEpoch)
+
+					// this is also handling FIP: if such a sector cannot be found, assert that the deal's end epoch has passed and use sector ID 0
+
+					if err := removeProviderSectorEntry(deal, &newState); err != nil {
+						return cid.Cid{}, cid.Cid{}, xerrors.Errorf("failed to remove provider sector entry: %w", err)
+					}
 				}
 			}
 

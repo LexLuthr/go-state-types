@@ -125,7 +125,7 @@ func (m *minerMigrator) MigrateState(ctx context.Context, store cbor.IpldStore, 
 				}
 				m.providerSectors.lk.Unlock()
 			case amt.Modify:
-				// oh snap deals??
+				// oh snap deals (no deals to deals), expiration extension, in case of reorgs maybe different deals
 
 				var sectorBefore miner.SectorOnChainInfo
 				if err := sectorBefore.UnmarshalCBOR(bytes.NewReader(change.Before.Raw)); err != nil {
