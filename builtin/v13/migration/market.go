@@ -131,7 +131,7 @@ func (m *marketMigrator) migrateProviderSectorsAndStates(ctx context.Context, st
 	return providerSectorsRoot, newStateArrayRoot, nil
 }
 
-func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Context, store cbor.IpldStore, prevInStatesCid, prevOutStatesCid, prevOutProviderSectorsCid, inStatesCid, proposals cid.Cid) (cid.Cid, cid.Cid, error) {
+func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Context, store cbor.IpldStore, prevInStatesCid, prevOutStatesCid, prevOutProviderSectorsCid, inStatesCid, prevInProposals cid.Cid) (cid.Cid, cid.Cid, error) {
 	diffs, err := amt.Diff(ctx, store, store, prevInStatesCid, inStatesCid, amt.UseTreeBitWidth(market12.StatesAmtBitwidth))
 	if err != nil {
 		return cid.Undef, cid.Undef, xerrors.Errorf("failed to diff old and new deal state AMTs: %w", err)
@@ -149,7 +149,7 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 		return cid.Undef, cid.Undef, xerrors.Errorf("failed to load prevOutProviderSectors map: %w", err)
 	}
 
-	proposalsArr, err := adt.AsArray(ctxStore, proposals, market12.ProposalsAmtBitwidth)
+	prevInProposalsArr, err := adt.AsArray(ctxStore, prevInProposals, market12.ProposalsAmtBitwidth)
 	if err != nil {
 		return cid.Undef, cid.Undef, xerrors.Errorf("failed to load proposals map: %w", err)
 	}
@@ -176,7 +176,7 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 		snum := newStatePrevState.SectorNumber
 
 		var proposals market12.DealProposal
-		found, err := proposalsArr.Get(uint64(deal), &proposals)
+		found, err := prevInProposalsArr.Get(uint64(deal), &proposals)
 		if err != nil {
 			return xerrors.Errorf("failed to get proposal for removed deal: %w", err)
 		}
@@ -207,7 +207,7 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 		deal := abi.DealID(change.Key)
 
 		switch change.Type {
-		case amt.Add:
+		case amt.Add: // both in case of chain going forward and chain reorg this is just new deals
 			var oldState market12.DealState
 			if err := oldState.UnmarshalCBOR(bytes.NewReader(change.After.Raw)); err != nil {
 				return cid.Cid{}, cid.Cid{}, xerrors.Errorf("failed to unmarshal old state: %w", err)
@@ -225,7 +225,7 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 					return cid.Cid{}, cid.Cid{}, xerrors.Errorf("failed to add provider sector entry: %w", err)
 				}
 				newState.SectorNumber = si
-			}
+			} // else FIP: if such a sector cannot be found, assert that the deal's end epoch has passed and use sector ID 0
 
 			//fmt.Printf("add deal %d to sector %d\n", deal, newState.SectorNumber)
 
@@ -233,7 +233,7 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 				return cid.Undef, cid.Undef, xerrors.Errorf("failed to set new state: %w", err)
 			}
 
-		case amt.Remove:
+		case amt.Remove: // both in case of chain going forward and chain reorg this is just removed deals
 			//fmt.Printf("remove deal %d\n", deal)
 
 			var prevOutState market13.DealState // note: this says "prevOut", not "prevOld"
@@ -257,7 +257,9 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 				return cid.Undef, cid.Undef, xerrors.Errorf("failed to delete new state: %w", err)
 			}
 
-		case amt.Modify:
+		case amt.Modify: // in case of chain going forward this is just deals changing states, in reorgs we may see different deals
+
+			// TODO: check that the deal is the same deal by looking at inProposalsArr and prevInProposalsArr
 
 			var oldState, prevOldState market12.DealState
 			var newState market13.DealState
@@ -287,6 +289,8 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 			if prevOldState.SlashEpoch == -1 && oldState.SlashEpoch != -1 {
 				// not slashed -> slashed
 				//fmt.Printf("deal %d slash -1 -> %d\n", deal, oldState.SlashEpoch)
+
+				// this is also handling FIP: if such a sector cannot be found, assert that the deal's end epoch has passed and use sector ID 0
 
 				if err := removeProviderSectorEntry(deal, &newState); err != nil {
 					return cid.Cid{}, cid.Cid{}, xerrors.Errorf("failed to remove provider sector entry: %w", err)
@@ -488,6 +492,7 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesFromScratch(ctx context.
 				//fmt.Printf("deal %d not found in providerSectors: %v\n", deal, oldState)
 
 				newState.SectorNumber = 0 // FIP: if such a sector cannot be found, assert that the deal's end epoch has passed and use sector ID 0
+				// note: the assert is done in the invariant 'deal sector number %d does not match sector %d for miner %v (ds: %#v; ss %#v)'
 			}
 		} /*else {
 			fmt.Printf("deal %d slashed, not inserting ProviderSectors record: %v\n", deal, oldState)

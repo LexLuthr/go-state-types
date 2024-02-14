@@ -3,6 +3,7 @@ package migration
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/filecoin-project/go-address"
@@ -93,7 +94,7 @@ func (m *minerMigrator) MigrateState(ctx context.Context, store cbor.IpldStore, 
 			return nil, xerrors.Errorf("failed to diff old and new Sector AMTs: %w", err)
 		}
 
-		for i, change := range diffs {
+		for _, change := range diffs {
 			sectorNo := abi.SectorNumber(change.Key)
 
 			switch change.Type {
@@ -139,7 +140,27 @@ func (m *minerMigrator) MigrateState(ctx context.Context, store cbor.IpldStore, 
 
 				if len(sectorBefore.DealIDs) != len(sectorAfter.DealIDs) {
 					if len(sectorBefore.DealIDs) != 0 {
-						return nil, xerrors.Errorf("WHAT?! sector %d modified, this not supported and not supposed to happen", i) // todo: is it? Can't happen w/o a deep, deep reorg, and even then we wouldn't use the cache??
+						// note: this case can only happen in case of a really deep reorg and in case that a sector is sealed with different sets of deals through that reorg
+						//  we best-effort handle this excedingly unlikely case here.
+
+						fmt.Printf("warn: prov dealsector deals MOD %d: %v -> %v\n", sectorNo, sectorBefore.DealIDs, sectorAfter.DealIDs)
+
+						newDealsAfter := make(map[abi.DealID]struct{})
+						for _, dealID := range sectorAfter.DealIDs {
+							newDealsAfter[dealID] = struct{}{}
+						}
+						for _, dealID := range sectorBefore.DealIDs {
+							delete(newDealsAfter, dealID)
+						}
+
+						m.providerSectors.lk.Lock()
+						for dealID := range newDealsAfter {
+							m.providerSectors.dealToSector[dealID] = abi.SectorID{
+								Miner:  abi.ActorID(mid),
+								Number: sectorNo,
+							}
+						}
+						m.providerSectors.lk.Unlock()
 					}
 					// snap
 
