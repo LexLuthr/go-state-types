@@ -172,10 +172,12 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 			return 0, xerrors.Errorf("deal %d not found in providerSectors", deal) // todo is this normal and possible??
 		}
 
-		if _, ok := providerSectorsMem[sid.Miner]; !ok {
-			providerSectorsMem[sid.Miner] = make(map[abi.SectorNumber][]abi.DealID)
+		sectorDeals, ok := providerSectorsMem[sid.Miner]
+		if !ok {
+			sectorDeals = make(map[abi.SectorNumber][]abi.DealID)
+			providerSectorsMem[sid.Miner] = sectorDeals
 		}
-		providerSectorsMem[sid.Miner][sid.Number] = append(providerSectorsMem[sid.Miner][sid.Number], deal)
+		sectorDeals[sid.Number] = append(sectorDeals[sid.Number], deal)
 
 		return sid.Number, nil
 	}
@@ -199,10 +201,12 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesWithDiff(ctx context.Con
 		mid := abi.ActorID(midd)
 
 		newStatePrevState.SectorNumber = 0
-		if _, ok := providerSectorsMemRemoved[mid]; !ok {
-			providerSectorsMemRemoved[mid] = make(map[abi.SectorNumber][]abi.DealID)
+		sectorDealsRemoved, ok := providerSectorsMemRemoved[mid]
+		if !ok {
+			sectorDealsRemoved = make(map[abi.SectorNumber][]abi.DealID)
+			providerSectorsMemRemoved[mid] = sectorDealsRemoved
 		}
-		providerSectorsMemRemoved[mid][snum] = append(providerSectorsMemRemoved[mid][snum], deal)
+		sectorDealsRemoved[snum] = append(sectorDealsRemoved[snum], deal)
 
 		return nil
 	}
@@ -544,10 +548,12 @@ func (m *marketMigrator) migrateProviderSectorsAndStatesFromScratch(ctx context.
 				newState.SectorNumber = sid.Number // FIP: set the new deal state object's sector number to the sector ID found;
 
 				// FIP: add the deal ID to the ProviderSectors mapping for the provider's actor ID and sector number.
-				if _, ok := providerSectorsMem[sid.Miner]; !ok {
-					providerSectorsMem[sid.Miner] = make(map[abi.SectorNumber][]abi.DealID)
+				sectorDeals, ok := providerSectorsMem[sid.Miner]
+				if !ok {
+					sectorDeals = make(map[abi.SectorNumber][]abi.DealID)
+					providerSectorsMem[sid.Miner] = sectorDeals
 				}
-				providerSectorsMem[sid.Miner][sid.Number] = append(providerSectorsMem[sid.Miner][sid.Number], deal)
+				sectorDeals[sid.Number] = append(sectorDeals[sid.Number], deal)
 			} else {
 				//fmt.Printf("deal %d not found in providerSectors: %v\n", deal, oldState)
 
